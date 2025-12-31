@@ -1,0 +1,335 @@
+
+Сборка: FastAPI + aiogram + Postgres + Redis + Worker + Nginx + HTTPS + Cloudflare hardening
+
+1) ОПИСАНИЕ ПРОЕКТА (что это)
+
+Авито парсер - это сервис, который мониторит новые объявления по заданным ссылкам (категория/город/фильтры),
+и как только появляются новые товары - отправляет уведомление пользователю в Telegram.
+
+- Клиент вставляет ссылку Avito (или ссылку поисковой выдачи с фильтрами)
+- Сервис начинает проверять выдачу с заданной частотой (интервал/тариф)
+- При появлении нового объявления - мгновенно отправляет в Telegram: ссылку, цену, название, доп. поля
+
+ВАЖНО про источник данных:
+- Прямой парсинг Avito может нарушать правила площадки и часто требует антибот/прокси.
+- В этой реализации предусмотрен источник SOURCE_KIND=apify (скрапинг через Apify actor), который берёт на себя
+  большую часть “антибот” нагрузки.
+- Если нужен прямой HTTP‑парсер под Avito — это отдельная задача (риски блокировок/юридические ограничения).
+
+2) КЛЮЧЕВЫЕ ФИЧИ (что есть в системе)
+
+(Пользовательские фичи)
+1) Мониторинг ссылок 
+   - добавление/удаление ссылок
+   - настройка интервала проверки
+   - хранение последнего “увиденного” объявления, чтобы не слать дубли
+
+2) Уведомления в Telegram
+   - отправка карточки: Название, Цена, Ссылка (+ доп. поля от источника)
+
+3) Тарифы/лимиты (SaaS‑модель)
+   - ограничения: сколько ссылок можно мониторить, минимальный интервал, скорость запросов (RPS)
+   - тарифы сидируются в БД (free/standard/pro) и применяются к пользователю
+
+(Коммерция / оплата)
+4) YooKassa (оплата подписки)
+   - создание платежа через API YooKassa
+   - webhook /yookassa/webhook для подтверждения платежа
+   - активация плана на 30 дней после payment.succeeded (с доп. проверкой статуса в YooKassa API)
+
+5) Авто‑снятие подписки (subscription reaper)
+   - фоновая проверка просроченных подписок
+   - авто‑даунгрейд на free
+
+(Надёжность и масштабирование)
+6) Worker‑архитектура
+   - отдельный воркерный процесс, который “ходит” по ссылкам и собирает новые объявления
+   - горизонтальное масштабирование: можно поднимать несколько worker контейнеров
+
+7) Rate limiting (Redis)
+   - ограничения запросов по тарифу (RPS) + глобальный лимит провайдера
+
+8) Метрики / мониторинг
+   - /metrics (Prometheus)
+   - /health (healthcheck)
+
+(Админка / эксплуатация)
+9) Admin UI (простая)
+   - HTML‑админка на FastAPI (точка входа /admin)
+   - защита заголовком X-Admin-Key (см. SECURITY ниже)
+
+10) Продакшн‑деплой
+   - Nginx reverse proxy
+   - HTTPS Let’s Encrypt (certbot) + автопродление
+   - systemd unit для автозапуска на VPS
+   - бэкапы Postgres (скрипты)
+   - maintenance mode + /status страница
+   - Cloudflare hardening: обновление IP‑листов + Cloudflare‑only firewall 80/443
+
+11) Безопасность (host level)
+   - UFW checklist
+   - ipset + iptables Cloudflare‑only режим 
+   - fail2ban шаблоны 
+
+3) СТРУКТУРА ПРОЕКТА (папки)
+
+  ├─ svc/                 Python код (API, bot, worker, модели, репозитории)
+  ├─ svc/sources/         Источники данных (apify/dummy + factory)
+  ├─ svc/payments/        Оплата (yookassa/stub + factory)
+  ├─ templates/           HTML шаблоны (админка)
+  ├─ docker/              Dockerfile'ы (api/worker/bot)
+  ├─ nginx/               Nginx конфиги + html (maintenance/status)
+  ├─ scripts/             Скрипты деплоя/SSL/бэкапов/Cloudflare/maintenance
+  ├─ systemd/             systemd unit + timer (Cloudflare ipset)
+  ├─ docs/                Документация (security/fail2ban/cloudflare rules)
+  ├─ docker-compose*.yml  Compose файлы (dev/prod/https/cloudflare/logs)
+  ├─ requirements.txt     Python зависимости
+  └─ .env.example         env (нужно заполнить)
+
+
+4) КОМАНДЫ TELEGRAM-БОТА (для клиентов)
+
+/start
+  - приветствие + краткая помощь
+
+/plan
+  - показывает текущий активный тариф (через API)
+
+/add <url> [sec]
+  - добавить ссылку на мониторинг
+  - sec (опционально) — интервал проверки в секундах
+  Пример: /add https://www.avito.ru/... 60
+
+/list
+  - список ваших активных ссылок
+
+/del <watch_id>
+  - удалить мониторинг по id (id берётся из /list)
+
+/interval <watch_id> <sec>
+  - поменять интервал для конкретной ссылки
+
+/buy <free|standard|pro>
+  - создаёт платеж (YooKassa) и возвращает ссылку на оплату
+  - после оплаты тариф активируется через webhook
+
+5) API (для сервисной части)
+
+Сервисный ключ: X-Service-Key: <SERVICE_API_KEY>
+
+Внутренние endpoints:
+- POST  /internal/upsert_user
+- GET   /internal/plan/{tg_user_id}
+- POST  /internal/watch
+- GET   /internal/watches/{tg_user_id}
+- DELETE /internal/watch/{watch_id}
+- PATCH /internal/watch/{watch_id}/interval
+
+Коммерция:
+- POST /payments/create  (создать платеж)
+- POST /yookassa/webhook (webhook YooKassa)
+
+Техническое:
+- GET /health
+- GET /metrics
+
+Админка:
+- GET /admin  (требует X-Admin-Key)
+
+6) ТАРИФЫ (пример логики)
+
+Тарифы сидируются в БД скриптом seed (обычно при первом старте).
+У тарифа есть:
+- max_watches          : сколько ссылок можно держать
+- min_interval_sec     : минимальный допустимый интервал проверки
+- max_rps              : лимит запросов в секунду на пользователя (через Redis rate limit)
+- price_rub_month      : цена (для YooKassa)
+
+
+
+ВАЖНО: “0–1 мин” зависит от:
+- интервала проверки
+- реальной скорости источника (Apify/прямой парсер)
+- задержки публикации в выдаче
+- лимитов/антибота площадки
+
+
+7) ЗАПУСК 
+
+Требования:
+- Docker + Docker Compose plugin
+
+Шаги:
+1) Скопируй env:
+   cp .env.example .env
+
+2) Заполни .env (минимум):
+   BOT_TOKEN=
+   SERVICE_API_KEY=
+   ADMIN_API_KEY=
+   DATABASE_URL=postgresql+asyncpg://postgres:postgres@postgres:5432/avito
+   REDIS_URL=redis://redis:6379/0
+   PUBLIC_BASE_URL=http://localhost:80    (если через nginx) или http://localhost:8000
+
+   SOURCE_KIND=apify
+   APIFY_TOKEN=... (если используешь apify)
+   APIFY_ACTOR_ID=... (по умолчанию есть)
+
+3) Запуск:
+   docker compose up --build
+
+4) Проверка:
+   - http://localhost/health
+   - http://localhost/status
+
+8) ПРОДАКШН НА VPS (HTTPS + автопродление)
+Файлы:
+- docker-compose.prod.yml
+- docker-compose.https.yml
+- scripts/init_letsencrypt.sh
+- systemd/avito-monitor.service
+
+Рекомендуемый путь на сервере:
+  /opt/avito-parser
+
+Шаги:
+1) Скопировать проект в /opt/avito-parser
+2) Создать .env и заполнить:
+   DOMAIN=monitor.example.com
+   ADMIN_DOMAIN=admin.monitor.example.com
+   LETSENCRYPT_EMAIL=you@domain
+   PUBLIC_BASE_URL=https://monitor.example.com
+
+3) Старт:
+   docker compose -f docker-compose.prod.yml -f docker-compose.https.yml up -d --build
+
+4) Первый выпуск сертификата:
+   chmod +x scripts/*.sh
+   DOMAIN=monitor.example.com ADMIN_DOMAIN=admin.monitor.example.com LETSENCRYPT_EMAIL=you@domain ./scripts/init_letsencrypt.sh
+
+5) systemd автозапуск:
+   sudo cp systemd/avito-monitor.service /etc/systemd/system/avito-monitor.service
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now avito-monitor
+   sudo systemctl status avito-monitor
+
+
+9)admin-сабдомен + защита endpoint’ов
+- Основной домен (DOMAIN): мониторинг/бот/публичные endpoints
+- Админ домен (ADMIN_DOMAIN): /admin и /metrics
+
+Правила:
+- На основном домене /metrics отдаёт 404
+- На admin-домене /metrics защищён basic-auth (htpasswd в nginx)
+
+Webhook:
+- /yookassa/webhook ограничен rate-limit на уровне Nginx (burst + r/s)
+- Можно дополнительно включить allowlist в nginx/conf.d/allow_yookassa.conf
+
+10) MAINTENANCE MODE + STATUS PAGE
+/status — публичная страница статуса.
+
+Включить тех.работы:
+  ./scripts/maintenance_on.sh
+Выключить:
+  ./scripts/maintenance_off.sh
+
+11) CLOUDFLARE режим 
+Если домен под Cloudflare, важно получать реальный IP клиента.
+
+1) Обновить nginx allowlist Cloudflare IPs:
+   ./scripts/update_cloudflare_ips.sh
+   docker compose -f docker-compose.prod.yml -f docker-compose.https.yml exec nginx nginx -s reload
+
+2) (ЖЁСТКИЙ режим) Cloudflare-only firewall 80/443:
+   sudo ./scripts/setup_cloudflare_firewall.sh
+
+Авто-обновление ipset раз в неделю:
+- systemd/cloudflare-ipset.service + systemd/cloudflare-ipset.timer
+
+Аварийно открыть 80/443 миру:
+- ./scripts/cloudflare_firewall_off.sh
+Вернуть Cloudflare-only:
+- ./scripts/cloudflare_firewall_on.sh
+
+12) БЭКАПЫ POSTGRES
+Сделать бэкап:
+  ./scripts/backup_postgres.sh
+
+Восстановить:
+  ./scripts/restore_postgres.sh backup_YYYYMMDD_HHMMSS.sql.gz
+
+Рекомендуется настроить cron на ежедневные бэкапы + выгрузку во внешний storage.
+
+13) МАСШТАБИРОВАНИЕ ПОД 150+ КЛИЕНТОВ
+1) Горизонтально поднимать worker:
+   docker compose -f docker-compose.prod.yml -f docker-compose.https.yml up -d --scale worker=4
+
+2) Тюнинг параметров:
+- GLOBAL_FETCH_RPS           : общий лимит запросов к источнику
+- WORKER_BATCH               : сколько “due” ссылок обрабатываем за цикл
+- WORKER_TICK_SEC            : пауза цикла
+- MAX_RESULTS_PER_CHECK       : сколько результатов брать за одну проверку
+
+3) База:
+- Postgres лучше держать на SSD
+- Следить за нагрузкой по метрикам
+
+14) SECURITY (кратко)
+1) X-Service-Key
+   - защищает внутренние API endpoints (бот/воркер используют его)
+
+2) X-Admin-Key
+   - защищает /admin
+   - дополнительно рекомендуется:
+     - Cloudflare Access для ADMIN_DOMAIN/admin*
+     - IP allow/deny или basic-auth на Nginx (см. nginx/conf.d/admin_protect.conf)
+
+3) UFW / fail2ban
+   - docs/SECURITY_CHECKLIST.md
+   - docs/FAIL2BAN_SETUP.md
+
+
+15) ЧТО ЕСТЬ В ПРОЕКТЕ:
+1) Реализовали SaaS‑ядро: пользователи, тарифы, лимиты, мониторинг ссылок
+2) Реализовали Telegram‑бота с командами управления ссылками и покупкой тарифа
+3) Реализовали worker‑сервис для постоянного мониторинга 24/7
+4) Реализовали rate-limit (Redis) для тарификации “1–10 запросов/сек”
+5) Реализовали оплату YooKassa + webhook + активацию тарифа на 30 дней
+6) Реализовали /metrics + /health + админку /admin
+7) Сделали продакшн‑деплой: Nginx reverse proxy + HTTPS Let’s Encrypt + systemd
+8) Добавили hardening:
+   - maintenance mode + status page
+   - Cloudflare IP update scripts + Cloudflare-only firewall
+   - fail2ban каркас
+   - admin-сабдомен + закрытие /metrics на основном домене + webhook rate-limit + allowlist‑шаблон
+
+16) БЫСТРЫЙ .env ШАБЛОН 
+BOT_TOKEN=...
+DATABASE_URL=postgresql+asyncpg://postgres:postgres@postgres:5432/avito
+REDIS_URL=redis://redis:6379/0
+
+SERVICE_API_KEY=change_me_service_key
+ADMIN_API_KEY=change_me_admin_key
+
+PUBLIC_BASE_URL=https://monitor.example.com
+
+SOURCE_KIND=apify
+APIFY_TOKEN=...
+APIFY_ACTOR_ID=songd~avito-search-scraper
+
+PAYMENTS_PROVIDER=yookassa
+YOOKASSA_SHOP_ID=...
+YOOKASSA_SECRET_KEY=...
+YOOKASSA_VALIDATE_IP=false
+
+DOMAIN=monitor.example.com
+ADMIN_DOMAIN=admin.monitor.example.com
+LETSENCRYPT_EMAIL=admin@example.com
+
+# Worker tuning (optional)
+GLOBAL_FETCH_RPS=20
+WORKER_BATCH=50
+WORKER_TICK_SEC=1
+MAX_RESULTS_PER_CHECK=30
+
